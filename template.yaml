@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This template creates the necessary resources to use Block Kit
+  when integrating an Amazon Lex chatbot with Slack
+
+Resources:
+  ListenFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: listen_slack_events/
+      Handler: listen.lambda_handler
+      Runtime: python3.8
+      Layers:
+         - !Ref SlackLambdaLayer
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn:
+             !Ref SlackLexBlockKitSecret
+        - AmazonLexRunBotsOnly
+        - SQSPollerPolicy:
+            QueueName: !GetAtt SlackEventQueue.QueueName
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SlackEventQueue.Arn
+            BatchSize: 1
+
+  OrderFlowerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: fulfill_lex/
+      Handler: order_flowers.lambda_handler
+      Runtime: python3.8
+      Layers:
+         - !Ref SlackLambdaLayer
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn:
+             !Ref SlackLexBlockKitSecret
+        - AmazonLexRunBotsOnly
+
+  SlackLambdaLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: slack-lex-block
+      Description: Slack sdk and urllib3
+      ContentUri: common
+      CompatibleRuntimes:
+        - python3.8
+    Metadata:
+        BuildMethod: makefile
+  
+  SlackEventQueue:
+    Type: AWS::SQS::Queue
+    Properties: 
+          QueueName: SlackEventQueue
+          KmsMasterKeyId: alias/aws/sqs
+          RedrivePolicy: 
+            deadLetterTargetArn: 
+              !GetAtt MyDeadLetterQueue.Arn
+            maxReceiveCount: 3
+  
+  MyDeadLetterQueue: 
+    Type: AWS::SQS::Queue
+    Properties: 
+          QueueName: SlackEventDeadLetterQueue
+          KmsMasterKeyId: alias/aws/sqs
+
+  ListenSlackApiRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "apigateway.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: ApiDirectWriteToSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Action:
+              - sqs:SendMessage
+              Effect: Allow
+              Resource:
+                - !GetAtt SlackEventQueue.Arn
+  
+  CloudWatchApiRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "apigateway.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  
+  ListenSlackApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: ListenSlackAPILogs
+      RetentionInDays: 7
+  
+  CloudWatchArnApiGateway:
+    Type: AWS::ApiGateway::Account
+    Properties: 
+      CloudWatchRoleArn: !GetAtt CloudWatchApiRole.Arn
+
+  ListenSlackApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      AccessLogSetting:
+          DestinationArn: !GetAtt ListenSlackApiLogs.Arn
+          Format: '$context.identity.sourceIp,$context.identity.caller,$context.identity.user,$context.requestTime,$context.httpMethod,$context.resourcePath,$context.protocol,$context.status,$context.responseLength,$context.requestId'
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+         title: SlackLexWithBlockKit
+         version: "1.0"
+        paths:
+          /flower:
+            post:
+              responses:
+                "200":
+                  description: "200 response"
+                  content: {}
+              x-amazon-apigateway-integration:
+                  integrationSubtype: "SQS-SendMessage"
+                  credentials:
+                    Fn::GetAtt: [ListenSlackApiRole, Arn]
+                  requestParameters:
+                      integration.request.header.Content-Type: '''application/x-www-form-urlencoded'''
+                  requestTemplates:
+                      application/x-www-form-urlencoded: Action=SendMessage&MessageBody=$util.urlEncode($util.escapeJavaScript($input.body))&MessageAttribute.1.Name=timestamp&MessageAttribute.1.Value.StringValue=$util.escapeJavaScript($input.params('X-Slack-Request-Timestamp'))&MessageAttribute.1.Value.DataType=String&MessageAttribute.2.Name=signature&MessageAttribute.2.Value.StringValue=$util.escapeJavaScript($input.params('X-Slack-Signature'))&MessageAttribute.2.Value.DataType=String
+                  passthroughBehavior: "never"
+                  uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${SlackEventQueue.QueueName}"
+                  payloadFormatVersion: "1.0"
+                  connectionType: "INTERNET"
+                  type: "aws"
+                  httpMethod: "POST"
+                  responses:
+                    default:
+                      statusCode: "200"
+        x-amazon-apigateway-importexport-version: "1.0"
+
+  SlackLexBlockKitSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: 
+      Description: Slack Signature, Slack Bot token, Lex bot Name, Lex bot alias and lex Channel Id
+      Name: "SLACK_LEX_BLOCK_KIT"
+      SecretString: 
+          '{"SLACK_BOT_TOKEN": "replace by your Bot User OAuth Token from OAuth & Permissions",
+          "SLACK_SIGNING_SECRET": "replace by your signing secret from Basic Information",
+          "BOT_NAME": "replace by your Lex bot name",
+          "BOT_ALIAS": "replace by your Lex bot alias name",
+          "LEX_SLACK_CHANNEL_ID": "replace by your Lex channel id"}'
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  ListenSlackApi:
+    Description: "API Gateway endpoint URL for Slack interactivity components"
+    Value: !Sub "https://${ListenSlackApi}.execute-api.${AWS::Region}.amazonaws.com/dev/flower/"
+  
